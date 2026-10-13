@@ -37,6 +37,7 @@ contract LaunchSystemHandler is Receipts {
     address[] internal _employers;
     address[] public tracked;
     uint256[] internal _potIds;
+    uint256[] internal _potOrderIds;
 
     uint256 public funded;
     uint256 public rang;
@@ -45,6 +46,10 @@ contract LaunchSystemHandler is Receipts {
     uint256 public totalMinted;
     uint256 public unexpectedReverts;
     string public firstUnexpected;
+    /// @dev How many claims ended by a receipt that returned the bond whole (`docs/THREATS.md`,
+    /// W2 and W3), and how many of those ended a pot in a refund with nothing forfeited (C2).
+    uint256 public bondsReturnedWhole;
+    uint256 public potsEndedWithNoBondForfeited;
 
     mapping(uint256 orderId => address) public employerOf;
     mapping(uint256 potId => bool) public launched;
@@ -157,6 +162,7 @@ contract LaunchSystemHandler is Receipts {
         vm.prank(who);
         try pots.launch(potId, POT_SPEC) returns (uint256 orderId) {
             employerOf[orderId] = address(pots);
+            _potOrderIds.push(orderId);
             launched[potId] = true;
             ++potsLaunched;
         } catch {
@@ -228,7 +234,12 @@ contract LaunchSystemHandler is Receipts {
         uint256 count = desk.orderCount();
         if (count == 0) return;
         // The first order that can still move, starting from a random one and wrapping around.
+        // A third of the time the start is a pot's order, which are few among a wallet's and the
+        // Doorbell's, so that every ending the desk allows is reached on a pot too.
         uint256 orderId = 1 + orderSeed % count;
+        if (orderSeed % 3 == 0 && _potOrderIds.length > 0) {
+            orderId = _potOrderIds[(orderSeed / 3) % _potOrderIds.length];
+        }
         for (uint256 tries; tries < count; ++tries) {
             IWorkOrders.State live = desk.stateOf(orderId);
             if (live != IWorkOrders.State.None && live < IWorkOrders.State.Delivered) break;
@@ -262,15 +273,42 @@ contract LaunchSystemHandler is Receipts {
             uint256 deliverBy = uint256(c.registeredAt) + o.deliverySecs;
             bool claimsAllowed = o.flags & desk.FLAG_ALLOW_CLAIMED() != 0;
             bool canClaim = vm.getBlockTimestamp() + desk.CHALLENGE_WINDOW() + desk.DISPUTE_WINDOW() <= deliverBy;
-            if (choice % 5 == 0 && claimsAllowed && canClaim) {
+            if (choice % 7 == 0 && claimsAllowed && canClaim) {
                 bytes32 named = keccak256(abi.encode("claimed", orderId));
                 _call(abi.encodeCall(desk.claimDelivered, (orderId, named)), c.runner, "claimDelivered");
-            } else if (choice % 5 == 1) {
+            } else if (choice % 7 == 1) {
                 _warpTo(deliverBy);
                 _call(abi.encodeCall(desk.timeout, (orderId)), address(0), "timeout");
-            } else if (choice % 5 == 2) {
+            } else if (choice % 7 == 2) {
+                // The job did not complete: only the runner may say so, and its bond comes back whole.
+                // Half the time, when the order's expiry comes before the delivery deadline, the
+                // runner waits it out first: the report then refunds the order (and ends a pot) with
+                // nothing forfeited (`docs/THREATS.md`, C2).
+                if ((choice >> 8) % 2 == 0 && o.expiresAt < deliverBy) _warpTo(o.expiresAt);
                 bytes memory failed = _land(orderId, o.employer, c.jobId, true, false);
-                _call(abi.encodeCall(desk.reportFailed, (orderId, failed, _none())), c.runner, "reportFailed");
+                _reportWithBondBack(orderId, o, c, failed, c.runner, runner, "reportFailed");
+            } else if (choice % 7 == 3) {
+                // Completed under another kind, with the order's own objective: anyone may report
+                // it, the bond comes back whole and the runner is not barred (`docs/THREATS.md`, W2).
+                bytes memory other = _landOtherKind(orderId, o.employer, c.jobId);
+                _reportWithBondBack(orderId, o, c, other, address(0), runner, "reportFailed.wrongKind");
+            } else if (choice % 7 == 4) {
+                // A job that is not this claim's: anyone may report it and the bond goes to the employer.
+                bytes memory wrong = _land(orderId, o.employer, c.jobId, false, true);
+                uint256 returnedBefore = _returnedOf(orderId);
+                uint256 runnerBefore = imd.balanceOf(c.runner);
+                if (_call(
+                        abi.encodeCall(desk.reportFailed, (orderId, wrong, _none())),
+                        address(0),
+                        "reportFailed.wrongJob"
+                    )) {
+                    if (imd.balanceOf(c.runner) != runnerBefore) {
+                        _unexpected("wrong job: the runner got something back");
+                    }
+                    if (_returnedOf(orderId) < returnedBefore + o.bond) {
+                        _unexpected("wrong job: bond not credited to employer");
+                    }
+                }
             } else {
                 bytes memory good = _land(orderId, o.employer, c.jobId, true, true);
                 _call(abi.encodeCall(desk.settle, (orderId, good, _none())), address(0), "settle");
@@ -334,11 +372,65 @@ contract LaunchSystemHandler is Receipts {
 
     // ---- helpers ----------------------------------------------------------------------------------------
 
-    function _call(bytes memory data, address as_, string memory what) internal {
+    function _call(bytes memory data, address as_, string memory what) internal returns (bool ok) {
         if (as_ != address(0)) vm.prank(as_);
-        (bool ok,) = address(desk).call(data);
+        (ok,) = address(desk).call(data);
         if (!ok) _unexpected(what);
         else ++hits[bytes32(bytes(what))];
+    }
+
+    /// @dev The two endings of `reportFailed` that return the bond whole: a receipt with the
+    /// order's own objective that is not `completed` (only the runner may report it) or that is
+    /// `completed` under another kind (anyone may). Checks what `docs/THREATS.md` W2, W3 and C2
+    /// say of them: the runner's balance rises by exactly the bond, the employer is credited
+    /// nothing but the escrow when the order has expired, the runner is not barred, and the order
+    /// is open again or refunded, never anything else. A stranger reporting the failed job is
+    /// refused (`NotRunner`), and a report that passes is counted so the soak test knows the path
+    /// was walked.
+    function _reportWithBondBack(
+        uint256 orderId,
+        IWorkOrdersRunner.Order memory o,
+        IWorkOrdersRunner.Claim memory c,
+        bytes memory record,
+        address as_,
+        address stranger,
+        string memory what
+    ) internal {
+        bytes memory data = abi.encodeCall(desk.reportFailed, (orderId, record, _none()));
+        if (as_ == c.runner && stranger != c.runner) {
+            vm.prank(stranger);
+            (bool strangerOk,) = address(desk).call(data);
+            if (strangerOk) _unexpected("a stranger reported the runner's failed job");
+        }
+        uint256 runnerBefore = imd.balanceOf(c.runner);
+        uint256 employerBefore = imd.balanceOf(o.employer);
+        uint256 returnedBefore = _returnedOf(orderId);
+        bool expired = vm.getBlockTimestamp() >= o.expiresAt;
+        if (!_call(data, as_, what)) return;
+        ++bondsReturnedWhole;
+        IWorkOrders.State ended = desk.stateOf(orderId);
+        if (imd.balanceOf(c.runner) != runnerBefore + o.bond) {
+            _unexpected(string.concat(what, ": bond not returned whole"));
+        }
+        if (desk.barred(orderId, c.runner)) _unexpected(string.concat(what, ": runner barred"));
+        uint256 returnedNow = _returnedOf(orderId);
+        uint256 credited = returnedNow >= returnedBefore ? returnedNow - returnedBefore : type(uint256).max;
+        if (expired) {
+            if (ended != IWorkOrders.State.Refunded) _unexpected(string.concat(what, ": expired order not refunded"));
+            if (credited != o.escrow) _unexpected(string.concat(what, ": refund credited != escrow"));
+            if (imd.balanceOf(o.employer) != employerBefore + o.escrow) {
+                _unexpected(string.concat(what, ": refund sent != escrow"));
+            }
+            if (o.employer == address(pots)) ++potsEndedWithNoBondForfeited;
+        } else {
+            if (ended != IWorkOrders.State.Open) _unexpected(string.concat(what, ": order not open again"));
+            if (credited != 0) _unexpected(string.concat(what, ": employer credited on a bond-back ending"));
+            if (imd.balanceOf(o.employer) != employerBefore) _unexpected(string.concat(what, ": employer paid"));
+        }
+    }
+
+    function _returnedOf(uint256 orderId) internal view returns (uint256 returned) {
+        (,,,, returned) = desk.accountOf(orderId);
     }
 
     function _unexpected(string memory what) internal {
@@ -368,6 +460,19 @@ contract LaunchSystemHandler is Receipts {
         _write(jobId, record);
     }
 
+    /// @dev The registry writes a `completed` receipt for the registered job with the order's own
+    /// objective but under the other kind: a research report for a Doorbell order, a picture for
+    /// everyone else. Such a receipt can never settle the order.
+    function _landOtherKind(uint256 orderId, address employer, bytes16 jobId) internal returns (bytes memory record) {
+        bytes memory spec =
+            employer == address(bell) ? bytes(bell.SPEC()) : employer == address(pots) ? POT_SPEC : WALLET_SPEC;
+        bytes memory objective = bytes.concat(desk.headerOf(orderId), spec);
+        record = employer == address(bell)
+            ? _recordOf(jobId, REAL_KIND, objective, "completed")
+            : _recordFrom(PICTURE_FIXTURE, jobId, objective);
+        _write(jobId, record);
+    }
+
     function _none() internal pure returns (address[] memory) {
         return new address[](0);
     }
@@ -389,12 +494,16 @@ contract LaunchSystemHandler is Receipts {
 /// - CrowdPots' balance covers what it has booked to contributors, and its IMD leaves only for the
 ///   desk or for contributors;
 /// - no allowance is left behind by any of the three contracts;
-/// - WorkProof never holds IMD, and every order's employer is who the model says.
+/// - WorkProof never holds IMD, and every order's employer is who the model says;
+/// - a receipt that shows the swarm did not complete the order's own job, or ran it under another
+///   kind, returns the bond whole and credits the employer nothing but an expired order's escrow,
+///   while a job that is not the order's forfeits the bond to the employer (the handler checks
+///   each such report as it is made; `docs/THREATS.md`, W2, W3 and C2).
 ///
 /// forge-config: default.invariant.runs = 48
 /// forge-config: default.invariant.depth = 120
 /// forge-config: default.invariant.fail-on-revert = false
-contract LaunchSystemInvariantTest is LaunchKit {
+contract LaunchSystemInvariantTest is LaunchKit, Receipts {
     WorkProof internal proof;
     WorkOrders internal desk;
     CrowdPots internal pots;
@@ -410,6 +519,7 @@ contract LaunchSystemInvariantTest is LaunchKit {
         vm.etch(Mainnet.WORK_REGISTRY, address(new RegistryStandIn()).code);
         vm.etch(Mainnet.PAYROLL, address(new PayrollStandIn(Mainnet.IMD)).code);
         imd = MockIMD(Mainnet.IMD);
+        registry = RegistryStandIn(Mainnet.WORK_REGISTRY);
 
         (address[] memory made,,) = _createFromManifest();
         proof = WorkProof(made[0]);
@@ -537,7 +647,7 @@ contract LaunchSystemInvariantTest is LaunchKit {
         assertGt(handler.potsLaunched(), 0, "no pot ever launched");
         assertGt(handler.walletOrders(), 0, "no wallet ever ordered");
 
-        string[12] memory paths = [
+        string[14] memory paths = [
             "refund",
             "cancel",
             "claim",
@@ -547,6 +657,8 @@ contract LaunchSystemInvariantTest is LaunchKit {
             "claimDelivered",
             "timeout",
             "reportFailed",
+            "reportFailed.wrongKind",
+            "reportFailed.wrongJob",
             "settle",
             "challenge",
             "finalize"
@@ -558,6 +670,13 @@ contract LaunchSystemInvariantTest is LaunchKit {
         emit log_named_uint("settle.disputed", handler.hits("settle.disputed"));
         emit log_named_uint("reportFailed.disputed", handler.hits("reportFailed.disputed"));
         emit log_named_uint("timeout.disputed", handler.hits("timeout.disputed"));
+        emit log_named_uint("claims ended with the bond returned whole", handler.bondsReturnedWhole());
+        emit log_named_uint("pots refunded by such an ending", handler.potsEndedWithNoBondForfeited());
+        assertEq(
+            handler.bondsReturnedWhole(),
+            handler.hits("reportFailed") + handler.hits("reportFailed.wrongKind"),
+            "a bond-back ending was counted that was not reported"
+        );
         for (uint256 i; i < paths.length; ++i) {
             assertGt(handler.hits(bytes32(bytes(paths[i]))), 0, string.concat("never reached: ", paths[i]));
         }
@@ -585,6 +704,75 @@ contract LaunchSystemInvariantTest is LaunchKit {
             paidOut += imd.sent(address(pots), funders[i]);
         }
         assertGt(paidOut, 0, "no contributor was ever refunded");
+    }
+
+    /// @notice The ending the random runs seldom reach on a pot, driven by hand on the
+    /// manifest-made contracts: the runbook's first pot opened receipt-only, filled and launched;
+    /// a runner takes the order an hour before its hire window closes, registers a job, and the
+    /// registry's receipt says the job did not complete. Nobody but the runner may report that
+    /// receipt, so the order cannot be freed sooner; once the window has passed, the runner's own
+    /// report refunds the order and so the pot, with the whole bond back and nothing forfeited
+    /// (`docs/THREATS.md`, W3 and C2). The desk still holds exactly what it owes afterwards, and
+    /// the contributors get back exactly what they chipped in.
+    function test_launch_aReceiptOnlyPotIsRefundedByTheRunnersOwnFailedReceipt_withNoBondForfeited() public {
+        (CrowdPots.Terms memory t, bytes memory spec) = _firstPot();
+        t.allowClaimed = false;
+        address opener = makeAddr("opener");
+        address funder = makeAddr("late funder");
+        address runner = makeAddr("honest runner");
+        address stranger = makeAddr("stranger");
+        imd.mint(opener, t.target);
+        imd.mint(funder, t.target);
+        imd.mint(runner, t.bond);
+        vm.startPrank(opener);
+        imd.approve(address(pots), type(uint256).max);
+        uint256 potId = pots.openPot(t, spec, 1);
+        vm.stopPrank();
+        vm.startPrank(funder);
+        imd.approve(address(pots), type(uint256).max);
+        pots.chipIn(potId, t.target - 1);
+        uint256 orderId = pots.launch(potId, spec);
+        vm.stopPrank();
+        uint256 expiresAt = pots.potOf(potId).orderExpiresAt;
+        assertEq(expiresAt, desk.orderOf(orderId).expiresAt);
+
+        vm.warp(expiresAt - 1 hours);
+        bytes16 job = bytes16(keccak256("the first pot's job"));
+        vm.startPrank(runner);
+        imd.approve(address(desk), t.bond);
+        desk.claim(orderId);
+        desk.register(orderId, job);
+        vm.stopPrank();
+        assertEq(imd.balanceOf(runner), 0, "the bond is posted");
+        bytes memory blocked = _recordOf(job, REAL_KIND, bytes.concat(desk.headerOf(orderId), spec), "blocked");
+        _write(job, blocked);
+
+        // Nobody else may end it, before or after the window; `timeout` is a week away.
+        vm.prank(stranger);
+        vm.expectRevert(IWorkOrdersRunner.NotRunner.selector);
+        desk.reportFailed(orderId, blocked, new address[](0));
+        vm.warp(expiresAt);
+        vm.prank(stranger);
+        vm.expectRevert(IWorkOrdersRunner.NotRunner.selector);
+        desk.reportFailed(orderId, blocked, new address[](0));
+        vm.expectRevert(IWorkOrdersRunner.TooEarly.selector);
+        desk.timeout(orderId);
+        assertEq(uint256(pots.reconcile(potId)), uint256(CrowdPots.Stage.Hiring), "held past its window");
+
+        vm.prank(runner);
+        desk.reportFailed(orderId, blocked, new address[](0));
+        assertEq(uint256(desk.stateOf(orderId)), uint256(IWorkOrders.State.Refunded));
+        assertEq(imd.balanceOf(runner), t.bond, "the whole bond came back");
+        assertFalse(desk.barred(orderId, runner));
+        (,,,, uint96 returned) = desk.accountOf(orderId);
+        assertEq(returned, t.target, "the escrow and not one wei of bond");
+        assertEq(imd.balanceOf(address(desk)), handler.owed(), "the desk holds exactly what it owes");
+
+        assertEq(uint256(pots.reconcile(potId)), uint256(CrowdPots.Stage.Refundable));
+        assertEq(pots.claimRefund(potId, opener), 1);
+        assertEq(pots.claimRefund(potId, funder), t.target - 1);
+        assertEq(imd.balanceOf(opener) + imd.balanceOf(funder), 2 * uint256(t.target), "exactly the chips, no more");
+        assertEq(imd.balanceOf(address(pots)), pots.owed(), "nothing stranded in the pots");
     }
 
     function _checkAll() internal view {
